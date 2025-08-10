@@ -1,0 +1,388 @@
+
+import React, { useEffect, useMemo, useState, useRef } from "react";
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+
+/**
+ * iOS-/Android-optimierter Offline-Wizard (PWA + Capacitor-tauglich)
+ * - Ein Feld pro Schritt (Next/Back)
+ * - Offline (Service Worker; AppShell)
+ * - Fotos anfügen (Kamera/Medien)
+ * - Signaturfeld (Finger/Stift) – als PNG ins PDF eingebettet
+ * - PDF erzeugen
+ * - E-Mail am Schluss (Web Share API mit Anhang; Fallback: mailto)
+ */
+
+const APP_NAME = "Entstörprotokoll Wizard";
+const CACHE_NAME = "ios-offline-wizard-v3";
+const DEFAULT_EMAIL = "service@beispiel.de"; // optionaler Startwert
+
+const A4 = { width: 595.28, height: 841.89 };
+
+type FieldDef = { id:string; label:string; type:"text"|"num"|"date"|"time"; mapTo:string };
+
+const FIELD_STEPS: FieldDef[] = [
+  { id: "workOrder", label: "Work-Order-Nr.", type: "text", mapTo: "Work-Order-Nr" },
+  { id: "anfahrt_datum", label: "Anfahrt – Datum", type: "date", mapTo: "Anfahrt_Datum" },
+  { id: "anfahrt_start", label: "Anfahrt – Start", type: "time", mapTo: "Anfahrt_Start" },
+  { id: "anfahrt_ende", label: "Anfahrt – Ende", type: "time", mapTo: "Anfahrt_Ende" },
+  { id: "anfahrt_total", label: "Anfahrt – Total (h:mm)", type: "text", mapTo: "Anfahrt_Total" },
+  { id: "arbeit_datum", label: "Arbeit – Datum", type: "date", mapTo: "Arbeit_Datum" },
+  { id: "arbeit_start", label: "Arbeit – Start", type: "time", mapTo: "Arbeit_Start" },
+  { id: "arbeit_ende", label: "Arbeit – Ende", type: "time", mapTo: "Arbeit_Ende" },
+  { id: "arbeit_total", label: "Arbeit – Total (h:mm)", type: "text", mapTo: "Arbeit_Total" },
+  { id: "km", label: "gefahrene km", type: "num", mapTo: "gefahrene_km" },
+  { id: "ag_name", label: "Auftraggeber – Name", type: "text", mapTo: "Auftraggeber_Name" },
+  { id: "ag_ap", label: "Ansprechpartner", type: "text", mapTo: "Auftraggeber_Ansprechpartner" },
+  { id: "u_name", label: "Unternehmen – Name", type: "text", mapTo: "Unternehmen_Name" },
+  { id: "u_str", label: "Unternehmen – Straße", type: "text", mapTo: "Unternehmen_Strasse" },
+  { id: "u_ort", label: "Unternehmen – PLZ/Ort", type: "text", mapTo: "Unternehmen_Ort" },
+  { id: "u_tech", label: "Techniker – Name", type: "text", mapTo: "Unternehmen_Techniker" },
+  { id: "obj_name", label: "Objekt – Name", type: "text", mapTo: "Objekt_Name" },
+  { id: "obj_standort", label: "Objekt – Standort", type: "text", mapTo: "Objekt_Standort" },
+  { id: "obj_str", label: "Objekt – Straße/Nummer", type: "text", mapTo: "Objekt_Strasse" },
+  { id: "obj_ort", label: "Objekt – PLZ/Ort", type: "text", mapTo: "Objekt_Ort" },
+  { id: "obj_vin", label: "VIN", type: "text", mapTo: "Objekt_VIN" },
+  { id: "obj_idx", label: "Index", type: "text", mapTo: "Objekt_Index" },
+  { id: "dcA", label: "DC-Meter A (kWh)", type: "num", mapTo: "DC_A" },
+  { id: "dcB", label: "DC-Meter B (kWh)", type: "num", mapTo: "DC_B" },
+  { id: "ac", label: "AC-Meter (kWh)", type: "num", mapTo: "AC" },
+  { id: "stoer_meld", label: "Störungsmeldung (kurz)", type: "text", mapTo: "Stoerungsmeldung" },
+  { id: "zustand", label: "Zustandsaufnahme", type: "text", mapTo: "Zustandsaufnahme" },
+  { id: "massnahmen", label: "Maßnahmen", type: "text", mapTo: "Massnahmen" },
+  { id: "ursache", label: "Ursache", type: "text", mapTo: "Ursache" },
+  { id: "entstoerungJa", label: "Entstörung/Reparatur abgeschlossen? (ja=✓)", type: "text", mapTo: "Entstoerung_check_ja" },
+  { id: "entstoerungNein", label: "…oder nein? (nein=✓)", type: "text", mapTo: "Entstoerung_check_nein" },
+  { id: "weitereJa", label: "Weitere Arbeiten erforderlich? (ja=✓)", type: "text", mapTo: "Weitere_Arbeiten_check_ja" },
+  { id: "weitereNein", label: "…oder nein? (nein=✓)", type: "text", mapTo: "Weitere_Arbeiten_check_nein" },
+  { id: "entstoer_nein_text", label: "Wenn NEIN, Beschreibung", type: "text", mapTo: "Entstoerung_nein" },
+  { id: "weitere_ja_text", label: "Weitere Arbeiten – Beschreibung", type: "text", mapTo: "Weitere_Arbeiten_ja" },
+  { id: "sonstiges", label: "Sonstige Anmerkungen", type: "text", mapTo: "Sonstige_Anmerkungen_1" },
+  { id: "g1", label: "G1", type: "text", mapTo: "G1" },
+  { id: "g2", label: "G2", type: "text", mapTo: "G2" },
+  { id: "g3", label: "G3", type: "text", mapTo: "G3" },
+  { id: "g4", label: "G4", type: "text", mapTo: "G4" },
+  { id: "g5", label: "G5", type: "text", mapTo: "G5" },
+  { id: "g6", label: "G6", type: "text", mapTo: "G6" },
+  { id: "minSoC", label: "min. SoC", type: "text", mapTo: "min_SoC" },
+  { id: "buffer", label: "Buffer", type: "text", mapTo: "Buffer" },
+  { id: "schluesseltyp", label: "Schlüsseltyp", type: "text", mapTo: "Schluesseltyp" },
+  { id: "ausfTech", label: "Ausführender Betrieb/Techniker", type: "text", mapTo: "Ausfuehrender_Techniker" },
+  { id: "techOrt", label: "Techniker – Ort/Datum", type: "text", mapTo: "Techniker_Ort" },
+  { id: "betreiber", label: "Betreiber – Name", type: "text", mapTo: "Betreiber" },
+  { id: "betreiberOrt", label: "Betreiber – Ort/Datum", type: "text", mapTo: "Betreiber_Ort" },
+  { id: "technikerName", label: "Name Techniker (Druckbuchstaben)", type: "text", mapTo: "Techniker_Name" },
+  { id: "betreiberName", label: "Name Betreiber (Druckbuchstaben)", type: "text", mapTo: "Betreiber_Name" },
+];
+
+const STEP_PHOTOS = "__PHOTOS__";
+const STEP_SIGN = "__SIGN__";
+const STEP_GENERATE = "__GENERATE__";
+
+export default function App() {
+  const [templateFile, setTemplateFile] = useState<File | null>(null);
+  const [answers, setAnswers] = useState<Record<string, string>>(() => {
+    try { return JSON.parse(localStorage.getItem("ios-wizard-answers") || "{}"); } catch { return {}; }
+  });
+  const [email, setEmail] = useState<string>(DEFAULT_EMAIL);
+  const [images, setImages] = useState<File[]>([]);
+  const [signatureData, setSignatureData] = useState<string | null>(null);
+  const [idx, setIdx] = useState<number>(-1);
+  const [pdfUrl, setPdfUrl] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => { try { localStorage.setItem("ios-wizard-answers", JSON.stringify(answers)); } catch {} }, [answers]);
+
+  // Minimaler Service Worker per Blob (offline shell)
+  useEffect(() => {
+    const swCode = `
+      const C='${CACHE_NAME}'; const S=['./'];
+      self.addEventListener('install',e=>{e.waitUntil(caches.open(C).then(c=>c.addAll(S)));self.skipWaiting()});
+      self.addEventListener('activate',e=>{e.waitUntil(self.clients.claim())});
+      self.addEventListener('fetch',e=>{const u=new URL(e.request.url);if(u.origin!==location.origin)return; e.respondWith(caches.match(e.request).then(m=>m||fetch(e.request).then(r=>{const rc=r.clone();caches.open(C).then(c=>c.put(e.request,rc));return r;})).catch(()=>caches.match('./')))})
+    `;
+    if ('serviceWorker' in navigator) {
+      const swUrl = URL.createObjectURL(new Blob([swCode], { type: 'text/javascript' }));
+      navigator.serviceWorker.register(swUrl).catch(()=>{});
+    }
+  }, []);
+
+  const stepsOrder = useMemo(() => [...FIELD_STEPS.map(s=>s.id), STEP_PHOTOS, STEP_SIGN, STEP_GENERATE], []);
+  const currentId = idx >= 0 ? stepsOrder[idx] : "__UPLOAD__";
+
+  const normalize = (s:string) => s.toLowerCase().replace(/\\s+/g,"").replace(/[:_\\-]/g,"").trim();
+  const setValue = (id:string, value:string) => setAnswers(a=>({ ...a, [id]: value }));
+  const next = () => setIdx(i=>Math.min(i+1, stepsOrder.length-1));
+  const prev = () => setIdx(i=>Math.max(i-1, -1));
+
+  async function onPickPhotos(files: FileList | null) {
+    if (!files) return; setImages(p=>[...p, ...Array.from(files)]);
+  }
+
+  async function buildPdf() {
+    if (!templateFile) { alert("Bitte die Original-PDF laden."); return; }
+    setBusy(true); setPdfUrl(null);
+    try {
+      const buf = await templateFile.arrayBuffer();
+      const pdfDoc = await PDFDocument.load(buf);
+      const form = pdfDoc.getForm();
+      const fields = form.getFields();
+      const map = new Map<string, any>(); fields.forEach(f=>map.set(f.getName(), f));
+      const find = (n:string) => { const t=normalize(n); for (const [k,v] of map) if (normalize(k)===t) return v; return null; };
+      const setText = (n:string,v?:string)=>{ if(!v) return; const f=find(n); if(!f) return; try{ form.getTextField(f.getName()).setText(v);}catch{} };
+      const check = (n:string,on:boolean)=>{ const f=find(n); if(!f) return; try{ const cb=form.getCheckBox(f.getName()); on?cb.check():cb.uncheck(); }catch{} };
+
+      for (const f of FIELD_STEPS) {
+        const val = answers[f.id];
+        if (f.mapTo.includes("check")) {
+          const truthy = (val||"").trim().toLowerCase().startsWith("j");
+          check(f.mapTo, truthy);
+        } else {
+          setText(f.mapTo, val);
+        }
+      }
+
+      if (images.length) {
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const margin = 32; const per=6; const cellW=(A4.width-margin*3)/2; const cellH=(A4.height-margin*4)/3;
+        for (let start=0; start<images.length; start+=per) {
+          const page = pdfDoc.addPage([A4.width,A4.height]);
+          page.drawText('Bilder & Dokumentation',{x:margin,y:A4.height-margin-12,size:14,font});
+          const slice = images.slice(start,start+per);
+          for (let i=0;i<slice.length;i++) {
+            const file = slice[i];
+            const bytes = new Uint8Array(await file.arrayBuffer());
+            const img = file.type.includes('png') ? await pdfDoc.embedPng(bytes) : await pdfDoc.embedJpg(bytes);
+            const d = img.scale(1);
+            const col=i%2,row=Math.floor(i/2);
+            const x=margin+col*(cellW+margin); const yTop=A4.height-margin*2-18-row*(cellH+margin);
+            const scale=Math.min(cellW/d.width,(cellH-18)/d.height); const w=d.width*scale,h=d.height*scale; const y=yTop-h;
+            page.drawImage(img,{x,y,width:w,height:h});
+            page.drawText(file.name,{x,y:y-12,size:10,font,color:rgb(0,0,0)});
+          }
+        }
+      }
+
+      if (signatureData) {
+        const png = await fetch(signatureData).then(r=>r.arrayBuffer());
+        const sigImg = await pdfDoc.embedPng(png);
+        const page = pdfDoc.addPage([A4.width, A4.height]);
+        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+        const margin = 32;
+        page.drawText('Unterschrift', { x: margin, y: A4.height - margin - 12, size: 14, font });
+        const maxW = A4.width - margin*2;
+        const maxH = 200;
+        const dims = sigImg.scale(1);
+        const scale = Math.min(maxW / dims.width, maxH / dims.height);
+        const w = dims.width * scale;
+        const h = dims.height * scale;
+        const x = margin + (maxW - w) / 2;
+        const y = margin + 40;
+        page.drawImage(sigImg, { x, y, width: w, height: h });
+      }
+
+      const out = await pdfDoc.save();
+      const blob = new Blob([out], { type: 'application/pdf' });
+      const url = URL.createObjectURL(blob); setPdfUrl(url);
+    } catch (e) { console.error(e); alert('PDF-Erstellung fehlgeschlagen.'); } finally { setBusy(false); }
+  }
+
+  async function sendPdf() {
+    if (!pdfUrl) { alert('Bitte zuerst PDF erstellen.'); return; }
+    if (!email || !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)) { alert('Bitte gültige E-Mail eingeben.'); return; }
+    const resp = await fetch(pdfUrl); const blob = await resp.blob();
+    const file = new File([blob], `Entstoerprotokoll_${answers.workOrder||'neu'}.pdf`, { type: 'application/pdf' });
+    const text = `Entstörprotokoll\\nWO: ${answers.workOrder||''}\\nEmpfänger: ${email}`;
+
+    if ((navigator as any).share && (navigator as any).canShare?.({ files: [file] })) {
+      try { await (navigator as any).share({ title: APP_NAME, text, files: [file] }); } catch(e) { console.warn(e); }
+    } else {
+      const a=document.createElement('a'); a.href=pdfUrl; a.download=file.name; a.click();
+      window.location.href = `mailto:${encodeURIComponent(email)}?subject=${encodeURIComponent('Entstörprotokoll '+(answers.workOrder||''))}&body=${encodeURIComponent('PDF wurde lokal gespeichert. Bitte im Anhang aus der Dateien-App auswählen.')}`;
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 text-gray-900 flex flex-col">
+      <header className="p-4 sticky top-0 bg-white border-b z-10">
+        <div className="max-w-md mx-auto">
+          <h1 className="text-lg font-semibold">{APP_NAME} – Offline</h1>
+          <p className="text-xs text-gray-500">Ein Feld • Fotos • Signatur • PDF • E-Mail</p>
+        </div>
+      </header>
+
+      <main className="flex-1 p-4">
+        <div className="max-w-md mx-auto space-y-4">
+          {currentId === "__UPLOAD__" && (
+            <div className="bg-white rounded-2xl shadow-sm border p-4 space-y-3">
+              <p className="text-sm text-gray-600">1) <b>Original-PDF</b> laden (Formularvorlage)</p>
+              <input type="file" accept="application/pdf" onChange={e=>setTemplateFile(e.target.files?.[0]||null)} />
+              {templateFile && <p className="text-xs text-gray-500">Ausgewählt: {templateFile.name}</p>}
+              <button className="btn" onClick={()=>setIdx(0)} disabled={!templateFile}>Weiter</button>
+              <ol className="list-decimal ml-5 text-xs text-gray-500 space-y-1">
+                <li>Auf iOS/Android im Browser öffnen → „Zum Startbildschirm“ (installieren).</li>
+                <li>App ist danach <b>offline</b> nutzbar.</li>
+              </ol>
+            </div>
+          )}
+
+          {FIELD_STEPS.some(s=>s.id===currentId) && (
+            <FieldStep def={FIELD_STEPS.find(s=>s.id===currentId)!} value={answers[currentId]||""} onChange={v=>setValue(currentId,v)} onBack={prev} onNext={next} idx={idx} total={stepsOrder.length} />
+          )}
+
+          {currentId === STEP_PHOTOS && (
+            <div className="bg-white rounded-2xl shadow-sm border p-4 space-y-3">
+              <h2 className="text-base font-semibold">Fotos anhängen</h2>
+              <input type="file" accept="image/*" capture="environment" multiple onChange={e=>onPickPhotos(e.target.files)} />
+              {!!images.length && (
+                <ul className="text-xs text-gray-600 list-disc ml-5">{images.map((f,i)=>(<li key={i}>{f.name} ({Math.round(f.size/1024)} KB)</li>))}</ul>
+              )}
+              <div className="flex gap-2 pt-2">
+                <button className="btn btn-secondary" onClick={prev}>Zurück</button>
+                <button className="btn" onClick={next}>Weiter</button>
+              </div>
+            </div>
+          )}
+
+          {currentId === STEP_SIGN && (
+            <SignatureStep signatureData={signatureData} setSignatureData={setSignatureData} onBack={prev} onNext={next} />
+          )}
+
+          {currentId === STEP_GENERATE && (
+            <div className="bg-white rounded-2xl shadow-sm border p-4 space-y-4">
+              <h2 className="text-base font-semibold">PDF erstellen & senden</h2>
+              <label className="block text-sm">
+                <span className="text-gray-700">E-Mail Empfänger</span>
+                <input className="mt-1 w-full bg-white border rounded-xl px-3 py-2 outline-none focus:ring-2 focus:ring-black/30" type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="z.B. service@example.com" />
+              </label>
+              <div className="flex gap-2">
+                <button className="btn" onClick={buildPdf} disabled={busy}>{busy?"Erstelle…":"PDF erstellen"}</button>
+                {pdfUrl && <a className="btn btn-secondary" href={pdfUrl} download={`Entstoerprotokoll_${answers.workOrder||'neu'}.pdf`}>Download</a>}
+              </div>
+              <div className="flex gap-2">
+                <button className="btn" onClick={sendPdf} disabled={!pdfUrl}>Senden</button>
+                <span className="text-xs text-gray-500 self-center">Hinweis: Share Sheet (Mail-App) mit Anhang; Fallback öffnet Mail mit Empfänger.</span>
+              </div>
+              <div className="flex gap-2 pt-1">
+                <button className="btn btn-secondary" onClick={prev}>Zurück</button>
+              </div>
+            </div>
+          )}
+        </div>
+      </main>
+
+      <footer className="p-4 border-t bg-white sticky bottom-0">
+        <div className="max-w-md mx-auto text-xs text-gray-500">Schritt {Math.max(0, idx+1)} / {stepsOrder.length} – {labelFor(currentId)}</div>
+      </footer>
+
+      <style>{`
+        .btn { padding: 0.5rem 1rem; border-radius: 1rem; background: #000; color: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+        .btn:disabled { opacity: .5; cursor: not-allowed; }
+        .btn-secondary { background: #e5e7eb; color: #111827; }
+      `}</style>
+    </div>
+  );
+}
+
+function labelFor(id: string) {
+  if (id === "__UPLOAD__") return "PDF laden";
+  if (id === "__PHOTOS__") return "Fotos";
+  if (id === "__SIGN__") return "Unterschrift";
+  if (id === "__GENERATE__") return "Erstellen";
+  const f = FIELD_STEPS.find(x=>x.id===id); return f?f.label:id;
+}
+
+function FieldStep({ def, value, onChange, onBack, onNext, idx, total }:{ def:FieldDef; value:string; onChange:(v:string)=>void; onBack:()=>void; onNext:()=>void; idx:number; total:number; }){
+  return (
+    <div className="bg-white rounded-2xl shadow-sm border p-4 space-y-3">
+      <label className="block text-sm">
+        <span className="text-gray-700">{def.label}</span>
+        <input className="mt-1 w-full bg-white border rounded-xl px-3 py-2 outline-none focus:ring-2 focus:ring-black/30" value={value} inputMode={def.type==="num"?"decimal":"text"} type={def.type==='date'||def.type==='time'?def.type:'text'} onChange={e=>onChange(e.target.value)} />
+      </label>
+      <div className="flex gap-2">
+        <button className="btn btn-secondary" onClick={onBack} disabled={idx<=0}>Zurück</button>
+        <button className="btn" onClick={onNext}>Weiter</button>
+      </div>
+      <div className="text-xs text-gray-500">({idx+1}/{total})</div>
+    </div>
+  );
+}
+
+function SignatureStep({ signatureData, setSignatureData, onBack, onNext }:{ signatureData: string|null; setSignatureData: (d:string|null)=>void; onBack: ()=>void; onNext: ()=>void; }){
+  const canvasRef = useRef<HTMLCanvasElement|null>(null);
+  const [drawing, setDrawing] = useState(false);
+
+  useEffect(() => {
+    const canvas = canvasRef.current; if (!canvas) return;
+    const dpr = Math.max(1, (window as any).devicePixelRatio || 1);
+    const w = Math.min(640, document.body.clientWidth - 48);
+    const h = Math.round(w * 0.5);
+    canvas.width = w * dpr; canvas.height = h * dpr; (canvas.style as any).width = w+'px'; (canvas.style as any).height = h+'px';
+    const ctx = canvas.getContext('2d'); if (ctx) { ctx.scale(dpr, dpr); ctx.fillStyle = '#fff'; ctx.fillRect(0,0,w,h); ctx.strokeStyle = '#000'; ctx.lineWidth = 2; (ctx as any).lineJoin = 'round'; (ctx as any).lineCap='round'; }
+  }, []);
+
+  useEffect(() => {
+    if (!signatureData || !canvasRef.current) return;
+    const img = new Image(); img.onload = () => {
+      const ctx = canvasRef.current!.getContext('2d')!; const w = (canvasRef.current as any).clientWidth; const h = (canvasRef.current as any).clientHeight;
+      ctx.drawImage(img, 0, 0, w, h);
+    }; (img as any).src = signatureData;
+  }, [signatureData]);
+
+  function getPos(e: any, rect: DOMRect) {
+    if ('touches' in e) { const t = e.touches[0]; return { x: t.clientX - rect.left, y: t.clientY - rect.top }; }
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  }
+
+  function start(e: any) {
+    const canvas = canvasRef.current; if (!canvas) return; const ctx = canvas.getContext('2d'); if (!ctx) return;
+    const r = canvas.getBoundingClientRect(); const { x, y } = getPos(e, r);
+    (ctx as any).beginPath(); (ctx as any).moveTo(x, y); setDrawing(true);
+  }
+  function move(e: any) {
+    if (!drawing) return; const canvas = canvasRef.current; if (!canvas) return; const ctx = canvas.getContext('2d'); if (!ctx) return;
+    const r = canvas.getBoundingClientRect(); const { x, y } = getPos(e, r);
+    (ctx as any).lineTo(x, y); (ctx as any).stroke();
+  }
+  function end() { setDrawing(false); }
+  function clear() {
+    const c = canvasRef.current; if (!c) return; const ctx = c.getContext('2d'); if (!ctx) return;
+    const w = (c as any).clientWidth; const h = (c as any).clientHeight;
+    ctx.fillStyle = '#fff'; (ctx as any).fillRect(0,0,w,h); setSignatureData(null);
+  }
+  function save() {
+    const c = canvasRef.current; if (!c) return; const data = (c as any).toDataURL('image/png'); setSignatureData(data);
+  }
+
+  return (
+    <div className="bg-white rounded-2xl shadow-sm border p-4 space-y-3">
+      <h2 className="text-base font-semibold">Unterschrift</h2>
+      <div className="border rounded-xl overflow-hidden">
+        <canvas
+          ref={canvasRef}
+          onMouseDown={start}
+          onMouseMove={move}
+          onMouseUp={end}
+          onMouseLeave={end}
+          onTouchStart={start}
+          onTouchMove={move}
+          onTouchEnd={end}
+        />
+      </div>
+      <div className="flex gap-2">
+        <button className="btn btn-secondary" onClick={clear}>Löschen</button>
+        <button className="btn" onClick={save}>Übernehmen</button>
+      </div>
+      <div className="flex gap-2 pt-2">
+        <button className="btn btn-secondary" onClick={onBack}>Zurück</button>
+        <button className="btn" onClick={onNext} disabled={!signatureData}>Weiter</button>
+      </div>
+      <p className="text-xs text-gray-500">Tipp: Mit dem Finger unterschreiben. Mit „Übernehmen“ wird die Unterschrift gespeichert und später ins PDF eingebettet.</p>
+    </div>
+  );
+}
+
+import React from 'react'
+import { createRoot } from 'react-dom/client'
+import App from './App'
+
+createRoot(document.getElementById('root')!).render(<App />)
